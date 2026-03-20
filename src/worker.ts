@@ -6,7 +6,7 @@ import {
   type PluginWebhookInput,
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
-import { COLORS, METRIC_NAMES, WEBHOOK_KEYS, ACP_PLUGIN_EVENT_PREFIX } from "./constants.js";
+import { COLORS, METRIC_NAMES, PLUGIN_ID, WEBHOOK_KEYS, ACP_PLUGIN_EVENT_PREFIX } from "./constants.js";
 import {
   postEmbed,
   getApplicationId,
@@ -341,9 +341,9 @@ const plugin = definePlugin({
     }
 
     if (config.enableEscalations !== false) {
-      ctx.events.on("escalation.created", async (event: PluginEvent) => {
+      ctx.events.on(`plugin.${PLUGIN_ID}.escalation-created`, async (event: PluginEvent) => {
         const payload = event.payload as unknown as EscalationCreatedPayload;
-        const escalationId = payload.escalationId || event.entityId;
+        const escalationId = payload.escalationId || event.entityId || "";
         payload.escalationId = escalationId;
 
         const channelId = await resolveChannel(ctx, event.companyId, escalationChannelId);

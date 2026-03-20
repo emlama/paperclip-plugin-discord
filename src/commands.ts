@@ -228,7 +228,7 @@ async function handleStatus(ctx: PluginContext, companyId: string): Promise<unkn
       : "No active agents";
 
     const issueList = issues.length > 0
-      ? issues.map((i: { identifier?: string; id: string; title?: string }) => `- **${i.identifier ?? i.id}** ${i.title ?? ""}`).join("\n")
+      ? issues.map((i: { identifier: string | null; id: string; title?: string }) => `- **${i.identifier ?? i.id}** ${i.title ?? ""}`).join("\n")
       : "No recent completions";
 
     const embeds: DiscordEmbed[] = [

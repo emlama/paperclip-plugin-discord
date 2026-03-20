@@ -1,4 +1,4 @@
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, AgentSessionEvent } from "@paperclipai/plugin-sdk";
 import type { DiscordEmbed, DiscordComponent } from "./discord-api.js";
 import { postEmbed, respondToInteraction } from "./discord-api.js";
 import {
@@ -269,15 +269,15 @@ export async function spawnAgentInThread(
       taskKey: `discord-thread-${threadId}`,
       reason: `Spawned in Discord thread for: ${taskPrompt.slice(0, 200)}`,
     });
-    sessionId = session.id ?? session.sessionId;
+    sessionId = session.sessionId;
 
     // Send the initial prompt
-    await ctx.agents.sessions.sendMessage(sessionId, companyId, {
+    await ctx.agents.sessions.sendMessage(sessionId!, companyId, {
       prompt: taskPrompt,
       reason: "Initial task prompt from Discord",
-      onEvent: (event: { type: string; data?: string }) => {
-        if (event.type === "output" && event.data) {
-          enqueueOutput(threadId, agentName, event.data);
+      onEvent: (event: AgentSessionEvent) => {
+        if (event.eventType === "chunk" && event.message) {
+          enqueueOutput(threadId, agentName, event.message);
           const isMulti = sessions.filter((s) => s.status === "running").length > 0;
           scheduleFlush(ctx, token, threadId, isMulti);
         }
@@ -482,9 +482,9 @@ export async function routeMessageToAgent(
       await ctx.agents.sessions.sendMessage(target.sessionId, companyId, {
         prompt: text,
         reason: "Message from Discord thread",
-        onEvent: (event: { type: string; data?: string }) => {
-          if (event.type === "output" && event.data) {
-            enqueueOutput(threadId, target!.agentDisplayName, event.data);
+        onEvent: (event: AgentSessionEvent) => {
+          if (event.eventType === "chunk" && event.message) {
+            enqueueOutput(threadId, target!.agentDisplayName, event.message);
             const isMulti = sessions.filter((s) => s.status === "running").length > 1;
             scheduleFlush(ctx, "", threadId, isMulti);
           }

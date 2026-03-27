@@ -1099,7 +1099,7 @@ async function handleCommands(
     });
   }
 
-  const companyId = cmdCtx?.companyId ?? "default";
+  const companyId = await resolveCompanyId(ctx);
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const channelId = cmdCtx?.defaultChannelId ?? "";
@@ -1372,7 +1372,7 @@ async function handleWorkflowApprovalButton(
 ): Promise<unknown> {
   const approved = customId.startsWith("wf_approve_");
   const approvalId = customId.replace(/^wf_(approve|reject)_/, "");
-  const companyId = cmdCtx?.companyId ?? "default";
+  const companyId = await resolveCompanyId(ctx);
   const baseUrl = cmdCtx?.baseUrl ?? "http://localhost:3100";
   const token = cmdCtx?.token ?? "";
   const channelId = cmdCtx?.defaultChannelId ?? "";

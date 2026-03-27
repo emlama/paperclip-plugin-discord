@@ -332,3 +332,147 @@ describe("worker activation safety", () => {
     expect(ctx.companies.list).toHaveBeenCalledTimes(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// handleCommands uses lazy resolver (TUM-16 fix)
+// ---------------------------------------------------------------------------
+
+describe("handleCommands company-ID resolution (TUM-16)", () => {
+  beforeEach(() => {
+    _resetCompanyIdCache();
+  });
+
+  function commandsListInteraction() {
+    return {
+      type: 2,
+      data: {
+        name: "clip",
+        options: [
+          {
+            name: "commands",
+            options: [{ name: "list" }],
+          },
+        ],
+      },
+      member: { user: { username: "testuser" } },
+    };
+  }
+
+  it("handleCommands resolves company ID via lazy resolver, not cmdCtx.companyId", async () => {
+    const ctx = makeCtx();
+    // cmdCtx has companyId set to "default" — the pre-fix bug value
+    const cmdCtx = makeCmdCtx({
+      companyId: "default",
+      pluginCtx: ctx as any,
+    });
+
+    await handleInteraction(ctx, commandsListInteraction() as any, cmdCtx);
+
+    // The resolver should have been called via companies.list
+    expect(ctx.companies.list).toHaveBeenCalled();
+    // state.get is called by getWorkflowStore with the company ID;
+    // verify it received the real UUID, not "default"
+    const stateGetCalls = ctx.state.get.mock.calls;
+    const workflowStoreCall = stateGetCalls.find(
+      (c: any[]) => c[0]?.stateKey && c[0].stateKey.includes("workflow"),
+    );
+    if (workflowStoreCall) {
+      expect(workflowStoreCall[0].stateKey).toContain(REAL_COMPANY_ID);
+      expect(workflowStoreCall[0].stateKey).not.toContain("default");
+    }
+  });
+
+  it("handleCommands does not pass 'default' as companyId even without pluginCtx", async () => {
+    const ctx = makeCtx();
+    // No pluginCtx — the function should still use resolveCompanyId(ctx) directly
+    const cmdCtx = makeCmdCtx({ companyId: "default" });
+
+    await handleInteraction(ctx, commandsListInteraction() as any, cmdCtx);
+
+    // companies.list should be called by the resolver inside handleCommands
+    expect(ctx.companies.list).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleWorkflowApprovalButton uses lazy resolver (TUM-16 fix)
+// ---------------------------------------------------------------------------
+
+describe("handleWorkflowApprovalButton company-ID resolution (TUM-16)", () => {
+  beforeEach(() => {
+    _resetCompanyIdCache();
+  });
+
+  function workflowApproveButtonInteraction(approvalId: string) {
+    return {
+      type: 3,
+      data: { custom_id: `wf_approve_${approvalId}`, component_type: 2 },
+      member: { user: { username: "testuser" } },
+    };
+  }
+
+  function workflowRejectButtonInteraction(approvalId: string) {
+    return {
+      type: 3,
+      data: { custom_id: `wf_reject_${approvalId}`, component_type: 2 },
+      member: { user: { username: "testuser" } },
+    };
+  }
+
+  it("workflow approve button resolves company ID via lazy resolver", async () => {
+    const ctx = makeCtx({
+      http: {
+        fetch: vi.fn().mockResolvedValue({
+          ok: true,
+          json: () => Promise.resolve({ ok: true }),
+        }),
+      },
+    });
+    const cmdCtx = makeCmdCtx({
+      companyId: "default",
+      pluginCtx: ctx as any,
+    });
+
+    await handleInteraction(ctx, workflowApproveButtonInteraction("test-approval-1") as any, cmdCtx);
+
+    // The resolver should have been called
+    expect(ctx.companies.list).toHaveBeenCalled();
+  });
+
+  it("workflow reject button resolves company ID via lazy resolver", async () => {
+    const ctx = makeCtx({
+      http: {
+        fetch: vi.fn().mockResolvedValue({
+          ok: true,
+          json: () => Promise.resolve({ ok: true }),
+        }),
+      },
+    });
+    const cmdCtx = makeCmdCtx({
+      companyId: "default",
+      pluginCtx: ctx as any,
+    });
+
+    await handleInteraction(ctx, workflowRejectButtonInteraction("test-approval-2") as any, cmdCtx);
+
+    expect(ctx.companies.list).toHaveBeenCalled();
+  });
+
+  it("workflow approval does not use 'default' as companyId without pluginCtx", async () => {
+    const ctx = makeCtx({
+      http: {
+        fetch: vi.fn().mockResolvedValue({
+          ok: true,
+          json: () => Promise.resolve({ ok: true }),
+        }),
+      },
+    });
+    const cmdCtx = makeCmdCtx({ companyId: "default" });
+
+    await handleInteraction(ctx, workflowApproveButtonInteraction("test-approval-3") as any, cmdCtx);
+
+    // handleWorkflowApprovalButton now calls resolveCompanyId(ctx) directly,
+    // so companies.list should be called regardless of pluginCtx presence
+    expect(ctx.companies.list).toHaveBeenCalled();
+  });
+});

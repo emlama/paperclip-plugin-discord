@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { type DiscordEmbed, respondToInteraction } from "./discord-api.js";
 import { COLORS, METRIC_NAMES } from "./constants.js";
+import { humanizeStatus } from "./formatters.js";
 import { withRetry, throwOnRetryableStatus } from "./retry.js";
 import { paperclipFetch } from "./paperclip-fetch.js";
 import { handleHandoffButton, handleDiscussionButton, handleAcpCommand } from "./session-registry.js";
@@ -20,6 +21,7 @@ interface InteractionOption {
   name: string;
   value?: string | number | boolean;
   options?: InteractionOption[];
+  focused?: boolean;
 }
 
 interface InteractionData {
@@ -99,6 +101,7 @@ export const SLASH_COMMANDS = [
             description: "Filter by project name",
             type: 3,
             required: false,
+            autocomplete: true,
           },
         ],
       },
@@ -106,6 +109,34 @@ export const SLASH_COMMANDS = [
         name: "agents",
         description: "Show all agents with status indicators",
         type: 1,
+        options: [
+          {
+            name: "company",
+            description: "Filter by company name or ID",
+            type: 3,
+            required: false,
+            autocomplete: true,
+          },
+        ],
+      },
+      {
+        name: "companies",
+        description: "List available companies",
+        type: 1,
+      },
+      {
+        name: "projects",
+        description: "List projects with optional company filter",
+        type: 1,
+        options: [
+          {
+            name: "company",
+            description: "Filter by company name or ID",
+            type: 3,
+            required: false,
+            autocomplete: true,
+          },
+        ],
       },
       {
         name: "help",
@@ -310,6 +341,10 @@ export async function handleInteraction(
     return handleButtonClick(ctx, interaction.data, interaction.member?.user.username, cmdCtx);
   }
 
+  if (interaction.type === 4 && interaction.data) {
+    return handleAutocomplete(ctx, interaction.data, cmdCtx);
+  }
+
   return respondToInteraction({
     type: 4,
     content: "Unknown interaction type.",
@@ -365,7 +400,11 @@ async function handleSlashCommand(
     case "issues":
       return handleIssues(ctx, companyId, getOption(subcommand.options ?? [], "project"), baseUrl);
     case "agents":
-      return handleAgents(ctx, companyId);
+      return handleAgents(ctx, companyId, getOption(subcommand.options ?? [], "company"), cmdCtx?.baseUrl);
+    case "companies":
+      return handleCompanies(ctx);
+    case "projects":
+      return handleProjects(ctx, companyId, getOption(subcommand.options ?? [], "company"), cmdCtx?.baseUrl);
     case "help":
       return handleHelp();
     case "connect":
@@ -389,13 +428,84 @@ async function handleSlashCommand(
   }
 }
 
+async function handleAutocomplete(
+  ctx: PluginContext,
+  data: InteractionData,
+  cmdCtx?: CommandContext,
+): Promise<unknown> {
+  const subcommand = data.options?.[0];
+  if (!subcommand) return { type: 8, data: { choices: [] } };
+
+  const focusedOption = subcommand.options?.find((o) => o.focused);
+  if (!focusedOption) return { type: 8, data: { choices: [] } };
+
+  const query = (focusedOption.value?.toString() ?? "").toLowerCase();
+
+  try {
+    if (focusedOption.name === "company") {
+      const companies = await ctx.companies.list();
+      const filtered = companies
+        .filter((c: { id: string; name?: string }) => {
+          const name = (c.name ?? c.id).toLowerCase();
+          return !query || name.includes(query) || c.id.toLowerCase().includes(query);
+        })
+        .slice(0, 25);
+      return {
+        type: 8,
+        data: {
+          choices: filtered.map((c: { id: string; name?: string }) => ({
+            name: c.name ?? c.id,
+            value: c.name ?? c.id,
+          })),
+        },
+      };
+    }
+
+    if (focusedOption.name === "project") {
+      const companyId = cmdCtx?.pluginCtx
+        ? await resolveCompanyId(cmdCtx.pluginCtx)
+        : (cmdCtx?.companyId ?? "default");
+      const base = cmdCtx?.baseUrl ?? "http://localhost:3100";
+      const resp = await paperclipFetch(
+        `${base}/api/companies/${companyId}/projects`,
+        { method: "GET" },
+      );
+      if (!resp.ok) return { type: 8, data: { choices: [] } };
+      const projects = (await resp.json()) as Array<{ id: string; name?: string }>;
+      const filtered = projects
+        .filter((p) => {
+          const name = (p.name ?? p.id).toLowerCase();
+          return !query || name.includes(query);
+        })
+        .slice(0, 25);
+      return {
+        type: 8,
+        data: {
+          choices: filtered.map((p) => ({
+            name: p.name ?? p.id,
+            value: p.name ?? p.id,
+          })),
+        },
+      };
+    }
+  } catch {
+    // Autocomplete failures should return empty choices, not error messages
+  }
+
+  return { type: 8, data: { choices: [] } };
+}
+
 async function handleStatus(ctx: PluginContext, companyId: string): Promise<unknown> {
   try {
     const agents = await ctx.agents.list({ companyId, status: "active" });
     const issues = await ctx.issues.list({ companyId, status: "done", limit: 5 });
 
     const agentList = agents.length > 0
-      ? agents.map((a: { name?: string; id: string }) => `- **${a.name ?? a.id}**`).join("\n")
+      ? agents.map((a: { name?: string | null; id: string; title?: string | null; role?: string | null }) => {
+          const label = a.name ?? a.id;
+          const detail = a.title || a.role;
+          return detail ? `- **${label}** — ${detail}` : `- **${label}**`;
+        }).join("\n")
       : "No active agents";
 
     const issueList = issues.length > 0
@@ -462,7 +572,7 @@ async function handleApprove(
       type: 4,
       embeds: [{
         title: "Approval Resolved",
-        description: `**Approved** \`${approvalId}\` by ${username ?? "Discord user"}`,
+        description: `Approved by **${username ?? "Discord user"}**.`,
         color: COLORS.GREEN,
         footer: { text: "Paperclip" },
         timestamp: new Date().toISOString(),
@@ -575,7 +685,7 @@ async function handleIssues(
       const emoji = statusEmoji[i.status] ?? "📋";
       const id = i.identifier ?? i.id;
       return {
-        name: `${emoji} ${id}`,
+        name: `${emoji} ${id} — ${humanizeStatus(i.status)}`,
         value: i.title ?? "(untitled)",
       };
     });
@@ -600,26 +710,63 @@ async function handleIssues(
   }
 }
 
-async function handleAgents(ctx: PluginContext, companyId: string): Promise<unknown> {
+async function handleAgents(
+  ctx: PluginContext,
+  companyId: string,
+  companyFilter?: string,
+  baseUrl?: string,
+): Promise<unknown> {
   try {
-    const agents = await ctx.agents.list({ companyId });
+    let resolvedCompanyId = companyId;
+    let companyLabel: string | undefined;
+
+    if (companyFilter) {
+      const companies = await ctx.companies.list();
+      const match = companies.find(
+        (c: { id: string; name?: string }) =>
+          c.id === companyFilter || c.name?.toLowerCase() === companyFilter.toLowerCase(),
+      );
+      if (!match) {
+        const names = companies.map((c: { name?: string; id: string }) => c.name || c.id).join(", ");
+        return respondToInteraction({
+          type: 4,
+          content: `Company "${companyFilter}" not found. Available: ${names || "none"}`,
+          ephemeral: true,
+        });
+      }
+      resolvedCompanyId = match.id;
+      companyLabel = match.name ?? match.id;
+    }
+
+    const agents = await ctx.agents.list({ companyId: resolvedCompanyId });
 
     if (agents.length === 0) {
-      return respondToInteraction({ type: 4, content: "No agents found.", ephemeral: true });
+      const suffix = companyLabel ? ` for ${companyLabel}` : "";
+      return respondToInteraction({ type: 4, content: `No agents found${suffix}.`, ephemeral: true });
     }
 
     const statusEmoji: Record<string, string> = {
       active: "🟢", error: "🔴", paused: "🟡", idle: "⚪", running: "🔵",
     };
 
-    const lines = agents.map((a: { name?: string; id: string; status: string }) => {
+    const statusLabel: Record<string, string> = {
+      active: "Active", error: "Error", paused: "Paused", idle: "Idle", running: "Running",
+    };
+
+    const lines = agents.map((a: { name?: string | null; id: string; status: string; title?: string | null; role?: string | null }) => {
       const emoji = statusEmoji[a.status] ?? "⚪";
-      return `${emoji} **${a.name ?? a.id}** — ${a.status}`;
+      const label = a.name ?? a.id;
+      const detail = a.title || a.role;
+      const statusText = statusLabel[a.status] ?? a.status;
+      return detail
+        ? `${emoji} **${label}** — ${detail} · ${statusText}`
+        : `${emoji} **${label}** — ${statusText}`;
     });
 
+    const title = companyLabel ? `Agents (${companyLabel})` : "Agents";
     const embeds: DiscordEmbed[] = [
       {
-        title: "Agents",
+        title,
         description: lines.join("\n"),
         color: COLORS.BLUE,
         footer: { text: "Paperclip" },
@@ -637,11 +784,137 @@ async function handleAgents(ctx: PluginContext, companyId: string): Promise<unkn
   }
 }
 
+async function handleCompanies(ctx: PluginContext): Promise<unknown> {
+  try {
+    const companies = await ctx.companies.list();
+
+    if (companies.length === 0) {
+      return respondToInteraction({ type: 4, content: "No companies found.", ephemeral: true });
+    }
+
+    const lines = companies.map((c: { id: string; name?: string }) => {
+      const label = c.name ?? c.id;
+      return `📋 **${label}**\n\u00A0\u00A0\u00A0\u00A0ID: \`${c.id}\``;
+    });
+
+    const embeds: DiscordEmbed[] = [
+      {
+        title: `Companies (${companies.length})`,
+        description: lines.join("\n"),
+        color: COLORS.BLUE,
+        footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      },
+    ];
+
+    return respondToInteraction({ type: 4, embeds, ephemeral: true });
+  } catch (error) {
+    return respondToInteraction({
+      type: 4,
+      content: `Failed to fetch companies: ${error instanceof Error ? error.message : String(error)}`,
+      ephemeral: true,
+    });
+  }
+}
+
+async function handleProjects(
+  ctx: PluginContext,
+  companyId: string,
+  companyFilter?: string,
+  baseUrl?: string,
+): Promise<unknown> {
+  try {
+    let resolvedCompanyId = companyId;
+    let companyLabel: string | undefined;
+
+    if (companyFilter) {
+      const companies = await ctx.companies.list();
+      const match = companies.find(
+        (c: { id: string; name?: string }) =>
+          c.id === companyFilter || c.name?.toLowerCase() === companyFilter.toLowerCase(),
+      );
+      if (!match) {
+        const names = companies.map((c: { name?: string; id: string }) => c.name || c.id).join(", ");
+        return respondToInteraction({
+          type: 4,
+          content: `Company "${companyFilter}" not found. Available: ${names || "none"}`,
+          ephemeral: true,
+        });
+      }
+      resolvedCompanyId = match.id;
+      companyLabel = match.name ?? match.id;
+    }
+
+    const base = baseUrl ?? "http://localhost:3100";
+    const resp = await withRetry(async () => {
+      const r = await paperclipFetch(
+        `${base}/api/companies/${resolvedCompanyId}/projects`,
+        { method: "GET" },
+      );
+      throwOnRetryableStatus(r);
+      return r;
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`API ${resp.status}: ${body}`);
+    }
+
+    const projects = (await resp.json()) as Array<{
+      id: string;
+      name?: string;
+      status?: string;
+      targetDate?: string | null;
+    }>;
+
+    if (projects.length === 0) {
+      const suffix = companyLabel ? ` for ${companyLabel}` : "";
+      return respondToInteraction({ type: 4, content: `No projects found${suffix}.`, ephemeral: true });
+    }
+
+    const statusEmoji: Record<string, string> = {
+      in_progress: "🔄",
+      completed: "✅",
+      planned: "📋",
+      on_hold: "⏸️",
+      cancelled: "🚫",
+    };
+
+    const lines = projects.map((p) => {
+      const emoji = statusEmoji[p.status ?? ""] ?? "📁";
+      const label = p.name ?? p.id;
+      const status = p.status ? ` · ${humanizeStatus(p.status)}` : "";
+      return `${emoji} **${label}**${status}\n\u00A0\u00A0\u00A0\u00A0ID: \`${p.id}\``;
+    });
+
+    const title = companyLabel ? `Projects (${companyLabel})` : `Projects (${projects.length})`;
+    const embeds: DiscordEmbed[] = [
+      {
+        title,
+        description: lines.join("\n"),
+        color: COLORS.BLUE,
+        footer: { text: "Paperclip" },
+        timestamp: new Date().toISOString(),
+      },
+    ];
+
+    return respondToInteraction({ type: 4, embeds, ephemeral: true });
+  } catch (error) {
+    return respondToInteraction({
+      type: 4,
+      content: `Failed to fetch projects: ${error instanceof Error ? error.message : String(error)}`,
+      ephemeral: true,
+    });
+  }
+}
+
 function handleHelp(): unknown {
   const commands = [
     "`/clip status` — Show active agents and recent completions",
+    "`/clip companies` — List available companies",
+    "`/clip projects [company]` — List projects",
     "`/clip issues [project]` — List open issues",
-    "`/clip agents` — Show all agents with status",
+    "`/clip agents [company]` — Show all agents with status",
     "`/clip approve <id>` — Approve a pending approval",
     "`/clip budget <agent>` — Check agent budget",
     "`/clip connect [company]` — Link channel to a company",
@@ -982,6 +1255,85 @@ async function handleButtonClick(
 
   if (customId.startsWith("wf_approve_") || customId.startsWith("wf_reject_")) {
     return handleWorkflowApprovalButton(ctx, customId, actor, cmdCtx);
+  }
+
+  if (customId.startsWith("issue_reopen_")) {
+    const issueId = customId.replace("issue_reopen_", "");
+    ctx.logger.info("Reopen button clicked", { issueId, actor });
+    try {
+      const resp = await withRetry(async () => {
+        const r = await paperclipFetch(`${base}/api/issues/${issueId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "todo", comment: `Reopened by ${actor} via Discord` }),
+        });
+        throwOnRetryableStatus(r);
+        return r;
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`API ${resp.status}: ${body}`);
+      }
+    } catch (err) {
+      ctx.logger.error("Failed to reopen issue", { issueId, error: String(err) });
+      return {
+        type: 7,
+        data: {
+          embeds: [{ title: "Reopen Failed", description: `Could not reopen — ${err instanceof Error ? err.message : String(err)}`, color: COLORS.RED, footer: { text: "Paperclip" }, timestamp: new Date().toISOString() }],
+          components: [],
+        },
+      };
+    }
+    return {
+      type: 7,
+      data: {
+        embeds: [{ title: "Issue Reopened", description: `Reopened by **${actor}**`, color: COLORS.YELLOW, footer: { text: "Paperclip" }, timestamp: new Date().toISOString() }],
+        components: [],
+      },
+    };
+  }
+
+  if (customId.startsWith("issue_assign_")) {
+    const issueId = customId.replace("issue_assign_", "");
+    ctx.logger.info("Assign to Me button clicked", { issueId, actor });
+    try {
+      const resp = await withRetry(async () => {
+        const r = await paperclipFetch(`${base}/api/issues/${issueId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assigneeUserId: `discord:${actor}`, comment: `Assigned to ${actor} via Discord` }),
+        });
+        throwOnRetryableStatus(r);
+        return r;
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        throw new Error(`API ${resp.status}: ${body}`);
+      }
+    } catch (err) {
+      ctx.logger.error("Failed to assign issue", { issueId, error: String(err) });
+      return respondToInteraction({ type: 4, content: `Could not assign — ${err instanceof Error ? err.message : String(err)}`, ephemeral: true });
+    }
+    return respondToInteraction({ type: 4, content: `✅ Assigned to **${actor}**`, ephemeral: true });
+  }
+
+  if (customId.startsWith("digest_blocked_")) {
+    const companyId = customId.replace("digest_blocked_", "");
+    ctx.logger.info("View Blocked button clicked", { companyId, actor });
+    try {
+      const issues = await ctx.issues.list({ companyId, status: "blocked", limit: 20 });
+      if (issues.length === 0) {
+        return respondToInteraction({ type: 4, content: "No blocked issues found.", ephemeral: true });
+      }
+      const lines = issues.map((i: { identifier?: string | null; id: string; title: string; blockerReason?: string }) => {
+        const reason = i.blockerReason ? `\n  → ${i.blockerReason}` : "";
+        return `• **${i.identifier ?? i.id}** — ${i.title}${reason}`;
+      });
+      return respondToInteraction({ type: 4, content: `🚫 **Blocked Issues (${issues.length})**\n\n${lines.join("\n").slice(0, 1900)}`, ephemeral: true });
+    } catch (err) {
+      ctx.logger.error("Failed to fetch blocked issues", { companyId, error: String(err) });
+      return respondToInteraction({ type: 4, content: `Could not fetch blocked issues — ${err instanceof Error ? err.message : String(err)}`, ephemeral: true });
+    }
   }
 
   return respondToInteraction({

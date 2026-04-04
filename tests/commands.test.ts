@@ -89,7 +89,7 @@ describe("/clip status", () => {
     const ctx = makeCtx({
       agents: {
         list: vi.fn().mockResolvedValue([
-          { id: "a1", name: "BD Agent" },
+          { id: "a1", name: "BD Agent", status: "active" },
         ]),
         sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
         invoke: vi.fn(),
@@ -140,7 +140,7 @@ describe("/clip status", () => {
     const ctx = makeCtx({
       agents: {
         list: vi.fn().mockResolvedValue([
-          { id: "a1", name: "CEO", title: "Chief Executive Officer" },
+          { id: "a1", name: "CEO", title: "Chief Executive Officer", status: "running" },
         ]),
         sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
         invoke: vi.fn(),
@@ -158,6 +158,33 @@ describe("/clip status", () => {
 
     expect(result.data.embeds[0].fields[0].value).toContain("CEO");
     expect(result.data.embeds[0].fields[0].value).toContain("Chief Executive Officer");
+  });
+
+  it("includes running agents in active agent count", async () => {
+    const ctx = makeCtx({
+      agents: {
+        list: vi.fn().mockResolvedValue([
+          { id: "a1", name: "Engineer", status: "running" },
+          { id: "a2", name: "CEO", status: "active" },
+          { id: "a3", name: "Paused Bot", status: "paused" },
+        ]),
+        sessions: { create: vi.fn(), sendMessage: vi.fn(), close: vi.fn() },
+        invoke: vi.fn(),
+      },
+      issues: { list: vi.fn().mockResolvedValue([]) },
+    });
+
+    const result = await handleInteraction(
+      ctx,
+      { type: 2, data: { name: "clip", options: [{ name: "status" }] } },
+      defaultCmdCtx,
+    ) as any;
+
+    const field = result.data.embeds[0].fields[0];
+    expect(field.name).toBe("Active Agents (2)");
+    expect(field.value).toContain("Engineer");
+    expect(field.value).toContain("CEO");
+    expect(field.value).not.toContain("Paused Bot");
   });
 
   it("handles empty agents and issues", async () => {

@@ -497,11 +497,15 @@ async function handleAutocomplete(
 
 async function handleStatus(ctx: PluginContext, companyId: string): Promise<unknown> {
   try {
-    const [agents, activeIssues, doneIssues] = await Promise.all([
-      ctx.agents.list({ companyId, status: "active" }),
+    const [allAgents, activeIssues, doneIssues] = await Promise.all([
+      ctx.agents.list({ companyId }),
       ctx.issues.list({ companyId, status: "in_progress", limit: 10 }),
       ctx.issues.list({ companyId, status: "done", limit: 5 }),
     ]);
+
+    const agents = allAgents.filter(
+      (a: { status?: string | null }) => a.status === "active" || a.status === "running",
+    );
 
     const agentList = agents.length > 0
       ? agents.map((a: { name?: string | null; id: string; title?: string | null; role?: string | null }) => {

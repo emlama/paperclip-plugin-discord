@@ -85,6 +85,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Channel ID for agent run lifecycle events. Falls back to default channel.",
         default: DEFAULT_CONFIG.bdPipelineChannelId,
       },
+      agentNotesChannelId: {
+        type: "string",
+        title: "Agent Notes Channel ID",
+        description:
+          "Default channel for ad-hoc notes posted by agents via the discord_post_message tool. Falls back to the default channel.",
+        default: DEFAULT_CONFIG.agentNotesChannelId,
+      },
       notifyOnIssueCreated: {
         type: "boolean",
         title: "Notify on issue created",
@@ -402,6 +409,38 @@ const manifest: PaperclipPluginManifestV1 = {
           cooldownMinutes: { type: "number", description: "Min minutes between triggers (default 60)" },
         },
         required: ["companyId", "watchName", "patterns", "responseTemplate"],
+      },
+    },
+    {
+      name: "discord_post_message",
+      displayName: "Post Discord Message",
+      description:
+        "Post an ad-hoc status update, note, question, or alert to a Discord channel. Use this to share progress, flag concerns, or leave a note for humans to read without interrupting them.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          content: {
+            type: "string",
+            description:
+              "The message body. Supports Discord markdown. Keep it under 1500 characters; longer messages will be truncated.",
+          },
+          kind: {
+            type: "string",
+            enum: ["note", "status", "question", "alert"],
+            description:
+              "Semantic category that drives the embed color and title. Defaults to 'note' (blue). 'status' is green, 'question' is yellow, 'alert' is red.",
+          },
+          channelId: {
+            type: "string",
+            description:
+              "Optional Discord channel ID to post to. Defaults to the configured agentNotesChannelId, then defaultChannelId.",
+          },
+          title: {
+            type: "string",
+            description: "Optional short title for the embed. Overrides the default title derived from kind.",
+          },
+        },
+        required: ["content"],
       },
     },
   ],

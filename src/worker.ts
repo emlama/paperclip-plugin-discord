@@ -44,6 +44,7 @@ import { DiscordAdapter } from "./adapter.js";
 import { processMediaMessage, type MediaAttachment } from "./media-pipeline.js";
 import { registerCommand, parseCommandMessage, executeCommand, listCommands } from "./custom-commands.js";
 import { registerWatch, checkWatches } from "./proactive-suggestions.js";
+import { resolveAgentName } from "./agent-name-cache.js";
 
 // Module-level state captured during setup() so onWebhook() can reuse it.
 let _pluginCtx: PluginContext | null = null;
@@ -66,6 +67,7 @@ type DiscordConfig = {
   approvalsChannelId: string;
   errorsChannelId: string;
   bdPipelineChannelId: string;
+  agentNotesChannelId: string;
   notifyOnIssueCreated: boolean;
   notifyOnIssueDone: boolean;
   notifyOnApprovalCreated: boolean;
@@ -94,6 +96,69 @@ type DiscordConfig = {
 };
 
 type IssueNotificationPayload = Record<string, unknown>;
+
+/**
+ * Heuristic: does this string look like an opaque agent ID (UUID or ULID),
+ * as opposed to a human-readable name?
+ *
+ * Used to decide whether to replace `agentName` with a cache-resolved name.
+ * The value may legitimately be a human name like "Trader" — in that case we
+ * keep it.
+ */
+function looksLikeAgentId(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  // UUID v4-ish: 8-4-4-4-12 hex
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) {
+    return true;
+  }
+  // ULID (26 Crockford base32 chars) or similar opaque 20+ char token with no spaces
+  if (/^[0-9A-Z]{20,}$/.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Walks the event payload looking for agent-id fields (`agentId`,
+ * `assigneeAgentId`, `fromAgentId`, …) and writes a resolved display name into
+ * the payload if one isn't present or looks like an ID.
+ *
+ * Returns a new event with an enriched payload, leaving the original event
+ * untouched. This runs for every notification before the formatter is called,
+ * so approval/run/error notifications don't show bare IDs.
+ */
+async function attachAgentName(
+  ctx: PluginContext,
+  event: PluginEvent,
+): Promise<PluginEvent> {
+  const payload = { ...(event.payload as Record<string, unknown>) };
+  const companyId = event.companyId;
+  if (!companyId) return event;
+
+  // If there's already a non-ID agentName, we're done.
+  const currentName = payload.agentName;
+  if (typeof currentName === "string" && currentName && !looksLikeAgentId(currentName)) {
+    return event;
+  }
+
+  // Try common id fields in priority order.
+  const idCandidates = [
+    payload.agentId,
+    payload.assigneeAgentId,
+    payload.fromAgentId,
+    payload.executionAgentId,
+    typeof currentName === "string" && looksLikeAgentId(currentName) ? currentName : null,
+  ].filter((v): v is string => typeof v === "string" && v.length > 0);
+
+  for (const id of idCandidates) {
+    const resolved = await resolveAgentName(ctx, companyId, id);
+    if (resolved) {
+      payload.agentName = resolved;
+      return { ...event, payload };
+    }
+  }
+
+  return event;
+}
 
 // EscalationRecord is imported from ./escalation-state.js
 
@@ -161,6 +226,14 @@ async function enrichIssueNotificationPayload(
       if (payload.projectName == null && issue.project?.name) payload.projectName = issue.project.name;
     }
 
+    // If agentName is still an ID or missing, resolve via the agent name cache.
+    // This covers cases where `executionAgentNameKey` holds a UUID instead of a
+    // display name, which shows up as ugly IDs in Discord notifications.
+    if (payload.assigneeAgentId && (!payload.agentName || looksLikeAgentId(payload.agentName))) {
+      const resolved = await resolveAgentName(ctx, companyId, String(payload.assigneeAgentId));
+      if (resolved) payload.agentName = resolved;
+    }
+
     if (String(payload.status ?? "") === "done") {
       const comments = await ctx.issues.listComments(event.entityId, companyId) as Array<{
         authorAgentId?: string | null;
@@ -170,11 +243,12 @@ async function enrichIssueNotificationPayload(
         updatedAt?: Date | string;
       }>;
       if (comments.length > 0) {
-        const lastComment = [...comments].sort((a, b) => {
+        const sorted = [...comments].sort((a, b) => {
           const aTs = new Date(String(a.updatedAt ?? a.createdAt ?? 0)).getTime();
           const bTs = new Date(String(b.updatedAt ?? b.createdAt ?? 0)).getTime();
           return bTs - aTs;
-        })[0];
+        });
+        const lastComment = sorted[0];
         if (payload.lastComment == null) payload.lastComment = lastComment.body;
         if (payload.completedBy == null) {
           if (lastComment.authorUserId) {
@@ -182,8 +256,32 @@ async function enrichIssueNotificationPayload(
               ? lastComment.authorUserId
               : "Board user";
           } else if (lastComment.authorAgentId) {
-            payload.completedBy = payload.agentName ?? "Agent";
+            const resolvedAgentName = await resolveAgentName(
+              ctx,
+              companyId,
+              lastComment.authorAgentId,
+            );
+            payload.completedBy = resolvedAgentName ?? payload.agentName ?? "Agent";
           }
+        }
+
+        // Add up to 2 prior comments (before the last one) as context. The
+        // formatter will render them in a "Prior activity" embed field.
+        if (payload.priorComments == null && sorted.length > 1) {
+          const prior: Array<{ author: string; body: string }> = [];
+          for (const c of sorted.slice(1, 3)) {
+            let author = "Unknown";
+            if (c.authorUserId) {
+              author = c.authorUserId.startsWith("discord:")
+                ? c.authorUserId.slice("discord:".length)
+                : "Board user";
+            } else if (c.authorAgentId) {
+              const resolved = await resolveAgentName(ctx, companyId, c.authorAgentId);
+              author = resolved ?? "Agent";
+            }
+            prior.push({ author, body: c.body });
+          }
+          payload.priorComments = prior;
         }
       }
 
@@ -192,8 +290,15 @@ async function enrichIssueNotificationPayload(
           payload.completedBy = payload.assigneeUserId.startsWith("discord:")
             ? payload.assigneeUserId
             : "Board user";
-        } else {
-          payload.completedBy = payload.agentName ?? payload.assigneeAgentId ?? null;
+        } else if (payload.agentName) {
+          payload.completedBy = payload.agentName;
+        } else if (payload.assigneeAgentId) {
+          const resolved = await resolveAgentName(
+            ctx,
+            companyId,
+            String(payload.assigneeAgentId),
+          );
+          payload.completedBy = resolved ?? payload.assigneeAgentId;
         }
       }
     }
@@ -453,7 +558,8 @@ const plugin = definePlugin({
       const channelId = await resolveChannel(ctx, event.companyId, topicChannel || overrideChannelId || config.defaultChannelId);
       if (!channelId) return;
 
-      const message = formatter(event, baseUrl);
+      const enrichedEvent = await attachAgentName(ctx, event);
+      const message = formatter(enrichedEvent, baseUrl);
       const messageId = await postEmbedWithId(ctx, token, channelId, message);
 
       if (messageId) {
@@ -1033,6 +1139,124 @@ const plugin = definePlugin({
       const cid = await resolveCompanyId(ctx);
       await checkWatches(ctx, token, cid, config.defaultChannelId);
     });
+
+    // ===================================================================
+    // Ad-hoc agent → Discord message tool
+    // ===================================================================
+
+    const POST_MESSAGE_KIND_STYLES = {
+      note: { color: COLORS.BLUE, title: "Agent note" },
+      status: { color: COLORS.GREEN, title: "Status update" },
+      question: { color: COLORS.YELLOW, title: "Question" },
+      alert: { color: COLORS.RED, title: "Alert" },
+    } as const;
+
+    ctx.tools.register(
+      "discord_post_message",
+      {
+        displayName: "Post Discord Message",
+        description:
+          "Post an ad-hoc status update, note, question, or alert to a Discord channel. Use this to share progress, flag concerns, or leave a note for humans to read without interrupting them.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description:
+                "The message body. Supports Discord markdown. Keep it under 1500 characters; longer messages will be truncated.",
+            },
+            kind: {
+              type: "string",
+              enum: ["note", "status", "question", "alert"],
+              description:
+                "Semantic category that drives embed color and title. Defaults to 'note' (blue).",
+            },
+            channelId: {
+              type: "string",
+              description:
+                "Optional Discord channel ID to post to. Defaults to the configured agentNotesChannelId, then defaultChannelId.",
+            },
+            title: {
+              type: "string",
+              description: "Optional short title for the embed. Overrides the default kind-derived title.",
+            },
+          },
+          required: ["content"],
+        },
+      },
+      async (params, runCtx) => {
+        const p = params as Record<string, unknown>;
+        const content = typeof p.content === "string" ? p.content : "";
+        if (!content.trim()) {
+          return { error: "content is required and cannot be empty." };
+        }
+
+        const kindRaw = typeof p.kind === "string" ? p.kind : "note";
+        const kind = (kindRaw in POST_MESSAGE_KIND_STYLES ? kindRaw : "note") as keyof typeof POST_MESSAGE_KIND_STYLES;
+        const style = POST_MESSAGE_KIND_STYLES[kind];
+
+        const requestedChannelId = typeof p.channelId === "string" && p.channelId.trim()
+          ? p.channelId.trim()
+          : null;
+        const fallbackChannelId = config.agentNotesChannelId || config.defaultChannelId;
+        const resolvedChannelId = await resolveChannel(
+          ctx,
+          runCtx.companyId,
+          requestedChannelId || fallbackChannelId,
+        );
+        if (!resolvedChannelId) {
+          return { error: "No Discord channel configured for discord_post_message." };
+        }
+
+        // Resolve the calling agent's display name for the footer.
+        let agentLabel: string | null = null;
+        if (runCtx.agentId) {
+          agentLabel = await resolveAgentName(ctx, runCtx.companyId, runCtx.agentId);
+        }
+        const footerText = agentLabel
+          ? `Posted by ${agentLabel}`
+          : runCtx.agentId
+            ? `Posted by agent ${runCtx.agentId}`
+            : "Paperclip agent";
+
+        const title = typeof p.title === "string" && p.title.trim()
+          ? p.title.trim()
+          : style.title;
+
+        const message = {
+          embeds: [
+            {
+              title,
+              description: content.slice(0, 4000),
+              color: style.color,
+              footer: { text: footerText },
+              timestamp: new Date().toISOString(),
+            },
+          ],
+        };
+
+        const posted = await postEmbed(ctx, token, resolvedChannelId, message);
+        if (!posted) {
+          return { error: "Failed to post message to Discord." };
+        }
+
+        await ctx.metrics.write(METRIC_NAMES.agentMessagesSent, 1);
+        ctx.logger.info("discord_post_message: posted", {
+          agentId: runCtx.agentId,
+          agentName: agentLabel,
+          kind,
+          channelId: resolvedChannelId,
+        });
+
+        return {
+          content: JSON.stringify({
+            status: "posted",
+            channelId: resolvedChannelId,
+            kind,
+          }),
+        };
+      },
+    );
 
     // ===================================================================
     // Daily Digest Job

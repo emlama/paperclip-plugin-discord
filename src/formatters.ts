@@ -138,7 +138,13 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
     explicitCompletedBy || assigneeName || executorName || agentName || assigneeUserId || assigneeAgentId,
   ) || "Unknown";
   const lastComment = p.lastComment ? String(p.lastComment) : null;
-  const summary = lastComment ? lastComment.slice(0, 200) : "No summary available";
+  // Cap at 1024 chars — Discord's per-field limit. The old 200-char cap hid
+  // most completion comments; raising it lets readers get the full summary
+  // without opening the issue.
+  const summary = lastComment ? lastComment.slice(0, 1024) : "No summary available";
+  const priorComments = Array.isArray(p.priorComments)
+    ? (p.priorComments as Array<Record<string, unknown>>)
+    : [];
   const parentIdentifier = p.parentIdentifier ? String(p.parentIdentifier) : null;
   const parentTitle = p.parentTitle ? String(p.parentTitle) : null;
   const parentId = p.parentId ? String(p.parentId) : null;
@@ -148,6 +154,18 @@ export function formatIssueDone(event: PluginEvent, baseUrl?: string): DiscordMe
   if (status) fields.push({ name: "Status", value: `\`${humanizeStatus(status)}\``, inline: true });
   if (priority) fields.push({ name: "Priority", value: `\`${humanizePriority(priority)}\``, inline: true });
   fields.push({ name: "Summary", value: summary });
+
+  if (priorComments.length > 0) {
+    const lines = priorComments.map((c) => {
+      const body = c.body ? String(c.body) : "";
+      const author = c.author ? String(c.author) : "";
+      const snippet = body.slice(0, 240);
+      return author ? `**${author}:** ${snippet}` : snippet;
+    });
+    const value = lines.join("\n\n").slice(0, 1024);
+    if (value) fields.push({ name: "Prior activity", value });
+  }
+
   if (parentIdentifier) {
     const parentLine = parentTitle
       ? `**${parentIdentifier}** — ${parentTitle}`

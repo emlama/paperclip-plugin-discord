@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-discord";
-export const PLUGIN_VERSION = "0.4.5";
+export const PLUGIN_VERSION = "0.7.1-emlama.1";
 
 export const WEBHOOK_KEYS = {
   discordInteractions: "discord-interactions",
@@ -20,6 +20,7 @@ export const DEFAULT_CONFIG = {
   approvalsChannelId: "",
   errorsChannelId: "",
   bdPipelineChannelId: "",
+  agentNotesChannelId: "",
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
@@ -74,6 +75,7 @@ export const METRIC_NAMES = {
   digestSent: "discord_digest_sent",
   workflowsExecuted: "discord_workflows_executed",
   budgetWarningsSent: "discord_budget_warnings_sent",
+  agentMessagesSent: "discord_agent_messages_sent",
 } as const;
 
 export const ROLE_WEIGHTS: Record<string, number> = {
